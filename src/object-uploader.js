@@ -125,15 +125,16 @@ export class ObjectUploader extends Transform {
 
         // If no upload ID exists, initiate a new one.
         if (!id) {
-          this.client.initiateNewMultipartUpload(this.bucketName, this.objectName, this.metaData).then(
-            (id) => {
-              this.id = id
+          this.client.initiateNewMultipartUpload(this.bucketName, this.objectName, this.metaData, (err, id) => {
+            if (err) {
+              return callback(err)
+            }
 
-              // We are now ready to accept new chunks — this will flush the buffered chunk.
-              this.emit('ready')
-            },
-            (err) => callback(err),
-          )
+            this.id = id
+
+            // We are now ready to accept new chunks — this will flush the buffered chunk.
+            this.emit('ready')
+          })
 
           return
         }
@@ -141,27 +142,26 @@ export class ObjectUploader extends Transform {
         this.id = id
 
         // Retrieve the pre-uploaded parts, if we need to resume the upload.
-        this.client.listParts(this.bucketName, this.objectName, id).then(
-          (etags) => {
-            // It is possible for no parts to be already uploaded.
-            if (!etags) {
-              etags = []
-            }
-
-            // oldParts will become an object, allowing oldParts[partNumber].etag
-            this.oldParts = etags.reduce(function (prev, item) {
-              if (!prev[item.part]) {
-                prev[item.part] = item
-              }
-              return prev
-            }, {})
-
-            this.emit('ready')
-          },
-          (err) => {
+        this.client.listParts(this.bucketName, this.objectName, id, (err, etags) => {
+          if (err) {
             return this.emit('error', err)
-          },
-        )
+          }
+
+          // It is possible for no parts to be already uploaded.
+          if (!etags) {
+            etags = []
+          }
+
+          // oldParts will become an object, allowing oldParts[partNumber].etag
+          this.oldParts = etags.reduce(function (prev, item) {
+            if (!prev[item.part]) {
+              prev[item.part] = item
+            }
+            return prev
+          }, {})
+
+          this.emit('ready')
+        })
       })
 
       return

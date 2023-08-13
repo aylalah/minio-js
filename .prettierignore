@@ -1,5 +1,0 @@
-/dist/
-*.md
-!docs/API.md
-!README.md
-/.github/workflows/
