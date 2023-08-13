@@ -27,8 +27,8 @@ import Xml from 'xml'
 import xml2js from 'xml2js'
 
 import * as errors from './errors.ts'
+import { extensions } from './extensions.js'
 import { CopyDestinationOptions, CopySourceOptions, DEFAULT_REGION } from './helpers.ts'
-import { callbackify } from './internal/callbackify.js'
 import { TypedClient } from './internal/client.ts'
 import { CopyConditions } from './internal/copy-conditions.ts'
 import {
@@ -56,6 +56,7 @@ import {
   readableStream,
   sanitizeETag,
   toMd5,
+  toSha256,
   uriEscape,
   uriResourceEscape,
 } from './internal/helper.ts'
@@ -64,7 +65,7 @@ import { LEGAL_HOLD_STATUS, RETENTION_MODES, RETENTION_VALIDITY_UNITS } from './
 import { NotificationConfig, NotificationPoller } from './notification.js'
 import { ObjectUploader } from './object-uploader.js'
 import { promisify } from './promisify.js'
-import { postPresignSignatureV4, presignSignatureV4 } from './signing.ts'
+import { postPresignSignatureV4, presignSignatureV4, signV4 } from './signing.ts'
 import * as transformers from './transformers.js'
 import { parseSelectObjectContentResponse } from './xml-parsers.js'
 
@@ -119,6 +120,264 @@ export class Client extends TypedClient {
       // Try part sizes as 64MB, 80MB, 96MB etc.
       partSize += 16 * 1024 * 1024
     }
+  }
+
+  // log the request, response, error
+  logHTTP(reqOptions, response, err) {
+    // if no logstreamer available return.
+    if (!this.logStream) {
+      return
+    }
+    if (!isObject(reqOptions)) {
+      throw new TypeError('reqOptions should be of type "object"')
+    }
+    if (response && !isReadableStream(response)) {
+      throw new TypeError('response should be of type "Stream"')
+    }
+    if (err && !(err instanceof Error)) {
+      throw new TypeError('err should be of type "Error"')
+    }
+    var logHeaders = (headers) => {
+      _.forEach(headers, (v, k) => {
+        if (k == 'authorization') {
+          var redacter = new RegExp('Signature=([0-9a-f]+)')
+          v = v.replace(redacter, 'Signature=**REDACTED**')
+        }
+        this.logStream.write(`${k}: ${v}\n`)
+      })
+      this.logStream.write('\n')
+    }
+    this.logStream.write(`REQUEST: ${reqOptions.method} ${reqOptions.path}\n`)
+    logHeaders(reqOptions.headers)
+    if (response) {
+      this.logStream.write(`RESPONSE: ${response.statusCode}\n`)
+      logHeaders(response.headers)
+    }
+    if (err) {
+      this.logStream.write('ERROR BODY:\n')
+      var errJSON = JSON.stringify(err, null, '\t')
+      this.logStream.write(`${errJSON}\n`)
+    }
+  }
+
+  // Enable tracing
+  traceOn(stream) {
+    if (!stream) {
+      stream = process.stdout
+    }
+    this.logStream = stream
+  }
+
+  // Disable tracing
+  traceOff() {
+    this.logStream = null
+  }
+
+  // makeRequest is the primitive used by the apis for making S3 requests.
+  // payload can be empty string in case of no payload.
+  // statusCode is the expected statusCode. If response.statusCode does not match
+  // we parse the XML error and call the callback with the error message.
+  // A valid region is passed by the calls - listBuckets, makeBucket and
+  // getBucketRegion.
+  makeRequest(options, payload, statusCodes, region, returnResponse, cb) {
+    if (!isObject(options)) {
+      throw new TypeError('options should be of type "object"')
+    }
+    if (!isString(payload) && !isObject(payload)) {
+      // Buffer is of type 'object'
+      throw new TypeError('payload should be of type "string" or "Buffer"')
+    }
+    statusCodes.forEach((statusCode) => {
+      if (!isNumber(statusCode)) {
+        throw new TypeError('statusCode should be of type "number"')
+      }
+    })
+    if (!isString(region)) {
+      throw new TypeError('region should be of type "string"')
+    }
+    if (!isBoolean(returnResponse)) {
+      throw new TypeError('returnResponse should be of type "boolean"')
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+    if (!options.headers) {
+      options.headers = {}
+    }
+    if (options.method === 'POST' || options.method === 'PUT' || options.method === 'DELETE') {
+      options.headers['content-length'] = payload.length
+    }
+    var sha256sum = ''
+    if (this.enableSHA256) {
+      sha256sum = toSha256(payload)
+    }
+    var stream = readableStream(payload)
+    this.makeRequestStream(options, stream, sha256sum, statusCodes, region, returnResponse, cb)
+  }
+
+  // makeRequestStream will be used directly instead of makeRequest in case the payload
+  // is available as a stream. for ex. putObject
+  makeRequestStream(options, stream, sha256sum, statusCodes, region, returnResponse, cb) {
+    if (!isObject(options)) {
+      throw new TypeError('options should be of type "object"')
+    }
+    if (!isReadableStream(stream)) {
+      throw new errors.InvalidArgumentError('stream should be a readable Stream')
+    }
+    if (!isString(sha256sum)) {
+      throw new TypeError('sha256sum should be of type "string"')
+    }
+    statusCodes.forEach((statusCode) => {
+      if (!isNumber(statusCode)) {
+        throw new TypeError('statusCode should be of type "number"')
+      }
+    })
+    if (!isString(region)) {
+      throw new TypeError('region should be of type "string"')
+    }
+    if (!isBoolean(returnResponse)) {
+      throw new TypeError('returnResponse should be of type "boolean"')
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+
+    // sha256sum will be empty for anonymous or https requests
+    if (!this.enableSHA256 && sha256sum.length !== 0) {
+      throw new errors.InvalidArgumentError(`sha256sum expected to be empty for anonymous or https requests`)
+    }
+    // sha256sum should be valid for non-anonymous http requests.
+    if (this.enableSHA256 && sha256sum.length !== 64) {
+      throw new errors.InvalidArgumentError(`Invalid sha256sum : ${sha256sum}`)
+    }
+
+    var _makeRequest = (e, region) => {
+      if (e) {
+        return cb(e)
+      }
+      options.region = region
+      var reqOptions = this.getRequestOptions(options)
+      if (!this.anonymous) {
+        // For non-anonymous https requests sha256sum is 'UNSIGNED-PAYLOAD' for signature calculation.
+        if (!this.enableSHA256) {
+          sha256sum = 'UNSIGNED-PAYLOAD'
+        }
+
+        let date = new Date()
+
+        reqOptions.headers['x-amz-date'] = makeDateLong(date)
+        reqOptions.headers['x-amz-content-sha256'] = sha256sum
+        if (this.sessionToken) {
+          reqOptions.headers['x-amz-security-token'] = this.sessionToken
+        }
+
+        this.checkAndRefreshCreds()
+        var authorization = signV4(reqOptions, this.accessKey, this.secretKey, region, date, sha256sum)
+        reqOptions.headers.authorization = authorization
+      }
+      var req = this.transport.request(reqOptions, (response) => {
+        if (!statusCodes.includes(response.statusCode)) {
+          // For an incorrect region, S3 server always sends back 400.
+          // But we will do cache invalidation for all errors so that,
+          // in future, if AWS S3 decides to send a different status code or
+          // XML error code we will still work fine.
+          delete this.regionMap[options.bucketName]
+          var errorTransformer = transformers.getErrorTransformer(response)
+          pipesetup(response, errorTransformer).on('error', (e) => {
+            this.logHTTP(reqOptions, response, e)
+            cb(e)
+          })
+          return
+        }
+        this.logHTTP(reqOptions, response)
+        if (returnResponse) {
+          return cb(null, response)
+        }
+        // We drain the socket so that the connection gets closed. Note that this
+        // is not expensive as the socket will not have any data.
+        response.on('data', () => {})
+        cb(null)
+      })
+      let pipe = pipesetup(stream, req)
+      pipe.on('error', (e) => {
+        this.logHTTP(reqOptions, null, e)
+        cb(e)
+      })
+    }
+    if (region) {
+      return _makeRequest(null, region)
+    }
+    this.getBucketRegion(options.bucketName, _makeRequest)
+  }
+
+  // gets the region of the bucket
+  getBucketRegion(bucketName, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError(`Invalid bucket name : ${bucketName}`)
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('cb should be of type "function"')
+    }
+
+    // Region is set with constructor, return the region right here.
+    if (this.region) {
+      return cb(null, this.region)
+    }
+
+    if (this.regionMap[bucketName]) {
+      return cb(null, this.regionMap[bucketName])
+    }
+    var extractRegion = (response) => {
+      var transformer = transformers.getBucketRegionTransformer()
+      var region = DEFAULT_REGION
+      pipesetup(response, transformer)
+        .on('error', cb)
+        .on('data', (data) => {
+          if (data) {
+            region = data
+          }
+        })
+        .on('end', () => {
+          this.regionMap[bucketName] = region
+          cb(null, region)
+        })
+    }
+
+    var method = 'GET'
+    var query = 'location'
+
+    // `getBucketLocation` behaves differently in following ways for
+    // different environments.
+    //
+    // - For nodejs env we default to path style requests.
+    // - For browser env path style requests on buckets yields CORS
+    //   error. To circumvent this problem we make a virtual host
+    //   style request signed with 'us-east-1'. This request fails
+    //   with an error 'AuthorizationHeaderMalformed', additionally
+    //   the error XML also provides Region of the bucket. To validate
+    //   this region is proper we retry the same request with the newly
+    //   obtained region.
+    var pathStyle = this.pathStyle && typeof window === 'undefined'
+
+    this.makeRequest({ method, bucketName, query, pathStyle }, '', [200], DEFAULT_REGION, true, (e, response) => {
+      if (e) {
+        if (e.name === 'AuthorizationHeaderMalformed') {
+          var region = e.Region
+          if (!region) {
+            return cb(e)
+          }
+          this.makeRequest({ method, bucketName, query }, '', [200], region, true, (e, response) => {
+            if (e) {
+              return cb(e)
+            }
+            extractRegion(response)
+          })
+          return
+        }
+        return cb(e)
+      }
+      extractRegion(response)
+    })
   }
 
   // Creates the bucket `bucketName`.
@@ -209,6 +468,32 @@ export class Client extends TypedClient {
     this.makeRequest({ method, bucketName, headers }, payload, [200], region, false, processWithRetry)
   }
 
+  // List of buckets created.
+  //
+  // __Arguments__
+  // * `callback(err, buckets)` _function_ - callback function with error as the first argument. `buckets` is an array of bucket information
+  //
+  // `buckets` array element:
+  // * `bucket.name` _string_ : bucket name
+  // * `bucket.creationDate` _Date_: date when bucket was created
+  listBuckets(cb) {
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+    var method = 'GET'
+    this.makeRequest({ method }, '', [200], DEFAULT_REGION, true, (e, response) => {
+      if (e) {
+        return cb(e)
+      }
+      var transformer = transformers.getListBucketTransformer()
+      var buckets
+      pipesetup(response, transformer)
+        .on('data', (result) => (buckets = result))
+        .on('error', (e) => cb(e))
+        .on('end', () => cb(null, buckets))
+    })
+  }
+
   // Returns a stream that emits objects that are partially uploaded.
   //
   // __Arguments__
@@ -259,11 +544,14 @@ export class Client extends TypedClient {
             result.uploads,
             (upload, cb) => {
               // for each incomplete upload add the sizes of its uploaded parts
-              this.listParts(bucket, upload.key, upload.uploadId).then((parts) => {
+              this.listParts(bucket, upload.key, upload.uploadId, (err, parts) => {
+                if (err) {
+                  return cb(err)
+                }
                 upload.size = parts.reduce((acc, item) => acc + item.size, 0)
                 uploads.push(upload)
                 cb()
-              }, cb)
+              })
             },
             (err) => {
               if (err) {
@@ -305,6 +593,28 @@ export class Client extends TypedClient {
         return cb(err)
       }
       cb(null, true)
+    })
+  }
+
+  // Remove a bucket.
+  //
+  // __Arguments__
+  // * `bucketName` _string_ : name of the bucket
+  // * `callback(err)` _function_ : `err` is `null` if the bucket is removed successfully.
+  removeBucket(bucketName, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+    var method = 'DELETE'
+    this.makeRequest({ method, bucketName }, '', [204], '', false, (e) => {
+      // If the bucket was successfully removed, remove the region map entry.
+      if (!e) {
+        delete this.regionMap[bucketName]
+      }
+      cb(e)
     })
   }
 
@@ -547,12 +857,153 @@ export class Client extends TypedClient {
     // Inserts correct `content-type` attribute based on metaData and filePath
     metaData = insertContentType(metaData, filePath)
 
-    fs.lstat(filePath, (err, stat) => {
-      if (err) {
-        return callback(err)
-      }
-      return this.putObject(bucketName, objectName, fs.createReadStream(filePath), stat.size, metaData, callback)
-    })
+    // Updates metaData to have the correct prefix if needed
+    metaData = prependXAMZMeta(metaData)
+    var size
+    var partSize
+
+    async.waterfall(
+      [
+        (cb) => fs.stat(filePath, cb),
+        (stats, cb) => {
+          size = stats.size
+          var stream
+          var cbTriggered = false
+          var origCb = cb
+          cb = function () {
+            if (cbTriggered) {
+              return
+            }
+            cbTriggered = true
+            if (stream) {
+              stream.destroy()
+            }
+            return origCb.apply(this, arguments)
+          }
+          if (size > this.maxObjectSize) {
+            return cb(new Error(`${filePath} size : ${stats.size}, max allowed size : 5TB`))
+          }
+          if (size <= this.partSize) {
+            // simple PUT request, no multipart
+            var multipart = false
+            var uploader = this.getUploader(bucketName, objectName, metaData, multipart)
+            var hash = transformers.getHashSummer(this.enableSHA256)
+            var start = 0
+            var end = size - 1
+            var autoClose = true
+            if (size === 0) {
+              end = 0
+            }
+            var options = { start, end, autoClose }
+            pipesetup(fs.createReadStream(filePath, options), hash)
+              .on('data', (data) => {
+                var md5sum = data.md5sum
+                var sha256sum = data.sha256sum
+                stream = fs.createReadStream(filePath, options)
+                uploader(stream, size, sha256sum, md5sum, (err, objInfo) => {
+                  callback(err, objInfo)
+                  cb(true)
+                })
+              })
+              .on('error', (e) => cb(e))
+            return
+          }
+          this.findUploadId(bucketName, objectName, cb)
+        },
+        (uploadId, cb) => {
+          // if there was a previous incomplete upload, fetch all its uploaded parts info
+          if (uploadId) {
+            return this.listParts(bucketName, objectName, uploadId, (e, etags) => cb(e, uploadId, etags))
+          }
+          // there was no previous upload, initiate a new one
+          this.initiateNewMultipartUpload(bucketName, objectName, metaData, (e, uploadId) => cb(e, uploadId, []))
+        },
+        (uploadId, etags, cb) => {
+          partSize = this.calculatePartSize(size)
+          var multipart = true
+          var uploader = this.getUploader(bucketName, objectName, metaData, multipart)
+
+          // convert array to object to make things easy
+          var parts = etags.reduce(function (acc, item) {
+            if (!acc[item.part]) {
+              acc[item.part] = item
+            }
+            return acc
+          }, {})
+          var partsDone = []
+          var partNumber = 1
+          var uploadedSize = 0
+          async.whilst(
+            (cb) => {
+              cb(null, uploadedSize < size)
+            },
+            (cb) => {
+              var stream
+              var cbTriggered = false
+              var origCb = cb
+              cb = function () {
+                if (cbTriggered) {
+                  return
+                }
+                cbTriggered = true
+                if (stream) {
+                  stream.destroy()
+                }
+                return origCb.apply(this, arguments)
+              }
+              var part = parts[partNumber]
+              var hash = transformers.getHashSummer(this.enableSHA256)
+              var length = partSize
+              if (length > size - uploadedSize) {
+                length = size - uploadedSize
+              }
+              var start = uploadedSize
+              var end = uploadedSize + length - 1
+              var autoClose = true
+              var options = { autoClose, start, end }
+              // verify md5sum of each part
+              pipesetup(fs.createReadStream(filePath, options), hash)
+                .on('data', (data) => {
+                  var md5sumHex = Buffer.from(data.md5sum, 'base64').toString('hex')
+                  if (part && md5sumHex === part.etag) {
+                    // md5 matches, chunk already uploaded
+                    partsDone.push({ part: partNumber, etag: part.etag })
+                    partNumber++
+                    uploadedSize += length
+                    return cb()
+                  }
+                  // part is not uploaded yet, or md5 mismatch
+                  stream = fs.createReadStream(filePath, options)
+                  uploader(uploadId, partNumber, stream, length, data.sha256sum, data.md5sum, (e, objInfo) => {
+                    if (e) {
+                      return cb(e)
+                    }
+                    partsDone.push({ part: partNumber, etag: objInfo.etag })
+                    partNumber++
+                    uploadedSize += length
+                    return cb()
+                  })
+                })
+                .on('error', (e) => cb(e))
+            },
+            (e) => {
+              if (e) {
+                return cb(e)
+              }
+              cb(null, partsDone, uploadId)
+            },
+          )
+        },
+        // all parts uploaded, complete the multipart upload
+        (etags, uploadId, cb) => this.completeMultipartUpload(bucketName, objectName, uploadId, etags, cb),
+      ],
+      (err, ...rest) => {
+        if (err === true) {
+          return
+        }
+        callback(err, ...rest)
+      },
+    )
   }
 
   // Uploads the object.
@@ -1048,6 +1499,111 @@ export class Client extends TypedClient {
     return readStream
   }
 
+  // Stat information of the object.
+  //
+  // __Arguments__
+  // * `bucketName` _string_: name of the bucket
+  // * `objectName` _string_: name of the object
+  // * `statOpts`  _object_ : Version of the object in the form `{versionId:'my-uuid'}`. Default is `{}`. (optional).
+  // * `callback(err, stat)` _function_: `err` is not `null` in case of error, `stat` contains the object information:
+  //   * `stat.size` _number_: size of the object
+  //   * `stat.etag` _string_: etag of the object
+  //   * `stat.metaData` _string_: MetaData of the object
+  //   * `stat.lastModified` _Date_: modified time stamp
+  //   * `stat.versionId` _string_: version id of the object if available
+  statObject(bucketName, objectName, statOpts = {}, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    // backward compatibility
+    if (isFunction(statOpts)) {
+      cb = statOpts
+      statOpts = {}
+    }
+
+    if (!isObject(statOpts)) {
+      throw new errors.InvalidArgumentError('statOpts should be of type "object"')
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+
+    var query = querystring.stringify(statOpts)
+    var method = 'HEAD'
+    this.makeRequest({ method, bucketName, objectName, query }, '', [200], '', true, (e, response) => {
+      if (e) {
+        return cb(e)
+      }
+
+      // We drain the socket so that the connection gets closed. Note that this
+      // is not expensive as the socket will not have any data.
+      response.on('data', () => {})
+
+      const result = {
+        size: +response.headers['content-length'],
+        metaData: extractMetadata(response.headers),
+        lastModified: new Date(response.headers['last-modified']),
+        versionId: getVersionId(response.headers),
+        etag: sanitizeETag(response.headers.etag),
+      }
+
+      cb(null, result)
+    })
+  }
+
+  // Remove the specified object.
+  //
+  // __Arguments__
+  // * `bucketName` _string_: name of the bucket
+  // * `objectName` _string_: name of the object
+  // * `removeOpts` _object_: Version of the object in the form `{versionId:'my-uuid', governanceBypass:true|false, forceDelete:true|false}`. Default is `{}`. (optional)
+  // * `callback(err)` _function_: callback function is called with non `null` value in case of error
+  removeObject(bucketName, objectName, removeOpts = {}, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    // backward compatibility
+    if (isFunction(removeOpts)) {
+      cb = removeOpts
+      removeOpts = {}
+    }
+
+    if (!isObject(removeOpts)) {
+      throw new errors.InvalidArgumentError('removeOpts should be of type "object"')
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+    const method = 'DELETE'
+    const queryParams = {}
+
+    if (removeOpts.versionId) {
+      queryParams.versionId = `${removeOpts.versionId}`
+    }
+    const headers = {}
+    if (removeOpts.governanceBypass) {
+      headers['X-Amz-Bypass-Governance-Retention'] = true
+    }
+    if (removeOpts.forceDelete) {
+      headers['x-minio-force-delete'] = true
+    }
+
+    const query = querystring.stringify(queryParams)
+
+    let requestOptions = { method, bucketName, objectName, headers }
+    if (query) {
+      requestOptions['query'] = query
+    }
+
+    this.makeRequest(requestOptions, '', [200, 204], '', false, cb)
+  }
+
   // Remove all the objects residing in the objectsList.
   //
   // __Arguments__
@@ -1104,7 +1660,7 @@ export class Client extends TypedClient {
         let deleteObjects = { Delete: { Quiet: true, Object: objects } }
         const builder = new xml2js.Builder({ headless: true })
         let payload = builder.buildObject(deleteObjects)
-        payload = Buffer.from(encoder.encode(payload))
+        payload = encoder.encode(payload)
         const headers = {}
 
         headers['Content-MD5'] = toMd5(payload)
@@ -1381,6 +1937,33 @@ export class Client extends TypedClient {
     })
   }
 
+  // Calls implemented below are related to multipart.
+
+  // Initiate a new multipart upload.
+  initiateNewMultipartUpload(bucketName, objectName, metaData, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    if (!isObject(metaData)) {
+      throw new errors.InvalidObjectNameError('contentType should be of type "object"')
+    }
+    var method = 'POST'
+    let headers = Object.assign({}, metaData)
+    var query = 'uploads'
+    this.makeRequest({ method, bucketName, objectName, query, headers }, '', [200], '', true, (e, response) => {
+      if (e) {
+        return cb(e)
+      }
+      var transformer = transformers.getInitiateMultipartTransformer()
+      pipesetup(response, transformer)
+        .on('error', (e) => cb(e))
+        .on('data', (uploadId) => cb(null, uploadId))
+    })
+  }
+
   // Complete the multipart upload. After all the parts are uploaded issuing
   // this call will aggregate the parts on the server into a single object.
   completeMultipartUpload(bucketName, objectName, uploadId, etags, cb) {
@@ -1444,6 +2027,76 @@ export class Client extends TypedClient {
             cb(null, completeMultipartResult)
           }
         })
+    })
+  }
+
+  // Get part-info of all parts of an incomplete upload specified by uploadId.
+  listParts(bucketName, objectName, uploadId, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    if (!isString(uploadId)) {
+      throw new TypeError('uploadId should be of type "string"')
+    }
+    if (!uploadId) {
+      throw new errors.InvalidArgumentError('uploadId cannot be empty')
+    }
+    var parts = []
+    var listNext = (marker) => {
+      this.listPartsQuery(bucketName, objectName, uploadId, marker, (e, result) => {
+        if (e) {
+          cb(e)
+          return
+        }
+        parts = parts.concat(result.parts)
+        if (result.isTruncated) {
+          listNext(result.marker)
+          return
+        }
+        cb(null, parts)
+      })
+    }
+    listNext(0)
+  }
+
+  // Called by listParts to fetch a batch of part-info
+  listPartsQuery(bucketName, objectName, uploadId, marker, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    if (!isString(uploadId)) {
+      throw new TypeError('uploadId should be of type "string"')
+    }
+    if (!isNumber(marker)) {
+      throw new TypeError('marker should be of type "number"')
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+    if (!uploadId) {
+      throw new errors.InvalidArgumentError('uploadId cannot be empty')
+    }
+    var query = ''
+    if (marker && marker !== 0) {
+      query += `part-number-marker=${marker}&`
+    }
+    query += `uploadId=${uriEscape(uploadId)}`
+
+    var method = 'GET'
+    this.makeRequest({ method, bucketName, objectName, query }, '', [200], '', true, (e, response) => {
+      if (e) {
+        return cb(e)
+      }
+      var transformer = transformers.getListPartsTransformer()
+      pipesetup(response, transformer)
+        .on('error', (e) => cb(e))
+        .on('data', (data) => cb(null, data))
     })
   }
 
@@ -1530,6 +2183,100 @@ export class Client extends TypedClient {
         })
     }
     listNext('', '')
+  }
+
+  // Returns a function that can be used for uploading objects.
+  // If multipart === true, it returns function that is used to upload
+  // a part of the multipart.
+  getUploader(bucketName, objectName, metaData, multipart) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isValidObjectName(objectName)) {
+      throw new errors.InvalidObjectNameError(`Invalid object name: ${objectName}`)
+    }
+    if (!isBoolean(multipart)) {
+      throw new TypeError('multipart should be of type "boolean"')
+    }
+    if (!isObject(metaData)) {
+      throw new TypeError('metadata should be of type "object"')
+    }
+
+    var validate = (stream, length, sha256sum, md5sum, cb) => {
+      if (!isReadableStream(stream)) {
+        throw new TypeError('stream should be of type "Stream"')
+      }
+      if (!isNumber(length)) {
+        throw new TypeError('length should be of type "number"')
+      }
+      if (!isString(sha256sum)) {
+        throw new TypeError('sha256sum should be of type "string"')
+      }
+      if (!isString(md5sum)) {
+        throw new TypeError('md5sum should be of type "string"')
+      }
+      if (!isFunction(cb)) {
+        throw new TypeError('callback should be of type "function"')
+      }
+    }
+    var simpleUploader = (...args) => {
+      validate(...args)
+      var query = ''
+      upload(query, ...args)
+    }
+    var multipartUploader = (uploadId, partNumber, ...rest) => {
+      if (!isString(uploadId)) {
+        throw new TypeError('uploadId should be of type "string"')
+      }
+      if (!isNumber(partNumber)) {
+        throw new TypeError('partNumber should be of type "number"')
+      }
+      if (!uploadId) {
+        throw new errors.InvalidArgumentError('Empty uploadId')
+      }
+      if (!partNumber) {
+        throw new errors.InvalidArgumentError('partNumber cannot be 0')
+      }
+      validate(...rest)
+      var query = `partNumber=${partNumber}&uploadId=${uriEscape(uploadId)}`
+      upload(query, ...rest)
+    }
+    var upload = (query, stream, length, sha256sum, md5sum, cb) => {
+      var method = 'PUT'
+      let headers = { 'Content-Length': length }
+
+      if (!multipart) {
+        headers = Object.assign({}, metaData, headers)
+      }
+
+      if (!this.enableSHA256) {
+        headers['Content-MD5'] = md5sum
+      }
+      this.makeRequestStream(
+        { method, bucketName, objectName, query, headers },
+        stream,
+        sha256sum,
+        [200],
+        '',
+        true,
+        (e, response) => {
+          if (e) {
+            return cb(e)
+          }
+          const result = {
+            etag: sanitizeETag(response.headers.etag),
+            versionId: getVersionId(response.headers),
+          }
+          // Ignore the 'data' event so that the stream closes. (nodejs stream requirement)
+          response.on('data', () => {})
+          cb(null, result)
+        },
+      )
+    }
+    if (multipart) {
+      return multipartUploader
+    }
+    return simpleUploader
   }
 
   // Remove all the notification configurations in the S3 provider
@@ -1684,7 +2431,7 @@ export class Client extends TypedClient {
     const headers = {}
     const builder = new xml2js.Builder({ headless: true, renderOpts: { pretty: false } })
     let payload = builder.buildObject(taggingConfig)
-    payload = Buffer.from(encoder.encode(payload))
+    payload = encoder.encode(payload)
     headers['Content-MD5'] = toMd5(payload)
     const requestOptions = { method, bucketName, query, headers }
 
@@ -1825,10 +2572,6 @@ export class Client extends TypedClient {
    * `cb(error, tags)` _function_ - callback function with `err` as the error argument. `err` is null if the operation is successful.
    */
   getBucketTagging(bucketName, cb) {
-    if (!isValidBucketName(bucketName)) {
-      throw new errors.InvalidBucketNameError(`Invalid bucket name: ${bucketName}`)
-    }
-
     const method = 'GET'
     const query = 'tagging'
     const requestOptions = { method, bucketName, query }
@@ -1912,7 +2655,7 @@ export class Client extends TypedClient {
       renderOpts: { pretty: false },
     })
     let payload = builder.buildObject(policyConfig)
-    payload = Buffer.from(encoder.encode(payload))
+    payload = encoder.encode(payload)
     const requestOptions = { method, bucketName, query, headers }
     headers['Content-MD5'] = toMd5(payload)
 
@@ -2239,6 +2982,82 @@ export class Client extends TypedClient {
     this.makeRequest({ method, bucketName, query }, '', [204], '', false, cb)
   }
 
+  setBucketReplication(bucketName, replicationConfig = {}, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isObject(replicationConfig)) {
+      throw new errors.InvalidArgumentError('replicationConfig should be of type "object"')
+    } else {
+      if (_.isEmpty(replicationConfig.role)) {
+        throw new errors.InvalidArgumentError('Role cannot be empty')
+      } else if (replicationConfig.role && !isString(replicationConfig.role)) {
+        throw new errors.InvalidArgumentError('Invalid value for role', replicationConfig.role)
+      }
+      if (_.isEmpty(replicationConfig.rules)) {
+        throw new errors.InvalidArgumentError('Minimum one replication rule must be specified')
+      }
+    }
+    if (!isFunction(cb)) {
+      throw new TypeError('callback should be of type "function"')
+    }
+
+    const method = 'PUT'
+    let query = 'replication'
+    const headers = {}
+
+    const replicationParamsConfig = {
+      ReplicationConfiguration: {
+        Role: replicationConfig.role,
+        Rule: replicationConfig.rules,
+      },
+    }
+
+    const builder = new xml2js.Builder({ renderOpts: { pretty: false }, headless: true })
+
+    let payload = builder.buildObject(replicationParamsConfig)
+
+    headers['Content-MD5'] = toMd5(payload)
+
+    this.makeRequest({ method, bucketName, query, headers }, payload, [200], '', false, cb)
+  }
+
+  getBucketReplication(bucketName, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    if (!isFunction(cb)) {
+      throw new errors.InvalidArgumentError('callback should be of type "function"')
+    }
+    const method = 'GET'
+    const query = 'replication'
+
+    this.makeRequest({ method, bucketName, query }, '', [200], '', true, (e, response) => {
+      if (e) {
+        return cb(e)
+      }
+
+      let replicationConfig = Buffer.from('')
+      pipesetup(response, transformers.replicationConfigTransformer())
+        .on('data', (data) => {
+          replicationConfig = data
+        })
+        .on('error', cb)
+        .on('end', () => {
+          cb(null, replicationConfig)
+        })
+    })
+  }
+
+  removeBucketReplication(bucketName, cb) {
+    if (!isValidBucketName(bucketName)) {
+      throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
+    }
+    const method = 'DELETE'
+    const query = 'replication'
+    this.makeRequest({ method, bucketName, query }, '', [200, 204], '', false, cb)
+  }
+
   getObjectLegalHold(bucketName, objectName, getOpts = {}, cb) {
     if (!isValidBucketName(bucketName)) {
       throw new errors.InvalidBucketNameError('Invalid bucket name: ' + bucketName)
@@ -2340,6 +3159,21 @@ export class Client extends TypedClient {
     headers['Content-MD5'] = toMd5(payload)
 
     this.makeRequest({ method, bucketName, objectName, query, headers }, payload, [200], '', false, cb)
+  }
+
+  /**
+   * Internal Method to abort a multipart upload request in case of any errors.
+   * @param bucketName __string__ Bucket Name
+   * @param objectName __string__ Object Name
+   * @param uploadId __string__ id of a multipart upload to cancel during compose object sequence.
+   * @param cb __function__ callback function
+   */
+  abortMultipartUpload(bucketName, objectName, uploadId, cb) {
+    const method = 'DELETE'
+    let query = `uploadId=${uploadId}`
+
+    const requestOptions = { method, bucketName, objectName: objectName, query }
+    this.makeRequest(requestOptions, '', [204], '', false, cb)
   }
 
   /**
@@ -2531,11 +3365,7 @@ export class Client extends TypedClient {
 
           async.map(uploadList, me.uploadPartCopy.bind(me), (err, res) => {
             if (err) {
-              this.abortMultipartUpload(destObjConfig.Bucket, destObjConfig.Object, uploadId).then(
-                () => cb(),
-                (err) => cb(err),
-              )
-              return
+              return this.abortMultipartUpload(destObjConfig.Bucket, destObjConfig.Object, uploadId, cb)
             }
             const partsDone = res.map((partCopy) => ({ etag: partCopy.etag, part: partCopy.part }))
             return me.completeMultipartUpload(destObjConfig.Bucket, destObjConfig.Object, uploadId, partsDone, cb)
@@ -2544,14 +3374,12 @@ export class Client extends TypedClient {
 
         const newUploadHeaders = destObjConfig.getHeaders()
 
-        me.initiateNewMultipartUpload(destObjConfig.Bucket, destObjConfig.Object, newUploadHeaders).then(
-          (uploadId) => {
-            performUploadParts(uploadId)
-          },
-          (err) => {
-            cb(err, null)
-          },
-        )
+        me.initiateNewMultipartUpload(destObjConfig.Bucket, destObjConfig.Object, newUploadHeaders, (err, uploadId) => {
+          if (err) {
+            return cb(err, null)
+          }
+          performUploadParts(uploadId)
+        })
       })
       .catch((error) => {
         cb(error, null)
@@ -2641,11 +3469,20 @@ export class Client extends TypedClient {
         })
     })
   }
+
+  get extensions() {
+    if (!this.clientExtensions) {
+      this.clientExtensions = new extensions(this)
+    }
+    return this.clientExtensions
+  }
 }
 
 // Promisify various public-facing APIs on the Client module.
 Client.prototype.makeBucket = promisify(Client.prototype.makeBucket)
+Client.prototype.listBuckets = promisify(Client.prototype.listBuckets)
 Client.prototype.bucketExists = promisify(Client.prototype.bucketExists)
+Client.prototype.removeBucket = promisify(Client.prototype.removeBucket)
 
 Client.prototype.getObject = promisify(Client.prototype.getObject)
 Client.prototype.getPartialObject = promisify(Client.prototype.getPartialObject)
@@ -2653,6 +3490,8 @@ Client.prototype.fGetObject = promisify(Client.prototype.fGetObject)
 Client.prototype.putObject = promisify(Client.prototype.putObject)
 Client.prototype.fPutObject = promisify(Client.prototype.fPutObject)
 Client.prototype.copyObject = promisify(Client.prototype.copyObject)
+Client.prototype.statObject = promisify(Client.prototype.statObject)
+Client.prototype.removeObject = promisify(Client.prototype.removeObject)
 Client.prototype.removeObjects = promisify(Client.prototype.removeObjects)
 
 Client.prototype.presignedUrl = promisify(Client.prototype.presignedUrl)
@@ -2683,16 +3522,10 @@ Client.prototype.getObjectRetention = promisify(Client.prototype.getObjectRetent
 Client.prototype.setBucketEncryption = promisify(Client.prototype.setBucketEncryption)
 Client.prototype.getBucketEncryption = promisify(Client.prototype.getBucketEncryption)
 Client.prototype.removeBucketEncryption = promisify(Client.prototype.removeBucketEncryption)
+Client.prototype.setBucketReplication = promisify(Client.prototype.setBucketReplication)
+Client.prototype.getBucketReplication = promisify(Client.prototype.getBucketReplication)
+Client.prototype.removeBucketReplication = promisify(Client.prototype.removeBucketReplication)
 Client.prototype.setObjectLegalHold = promisify(Client.prototype.setObjectLegalHold)
 Client.prototype.getObjectLegalHold = promisify(Client.prototype.getObjectLegalHold)
 Client.prototype.composeObject = promisify(Client.prototype.composeObject)
 Client.prototype.selectObjectContent = promisify(Client.prototype.selectObjectContent)
-
-// refactored API use promise internally
-Client.prototype.removeObject = callbackify(Client.prototype.removeObject)
-Client.prototype.statObject = callbackify(Client.prototype.statObject)
-Client.prototype.removeBucket = callbackify(Client.prototype.removeBucket)
-Client.prototype.listBuckets = callbackify(Client.prototype.listBuckets)
-Client.prototype.removeBucketReplication = callbackify(Client.prototype.removeBucketReplication)
-Client.prototype.setBucketReplication = callbackify(Client.prototype.setBucketReplication)
-Client.prototype.getBucketReplication = callbackify(Client.prototype.getBucketReplication)
